@@ -1,0 +1,95 @@
+name: release-toolchain
+on:
+  push: { branches: [master] }      # or tags ['v*'], or workflow_dispatch
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  # ---- 1. Build a bundle on each target OS ----------------------------------
+  bundle:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest,  platform: linux-x64,   ext: ""    }
+          - { os: windows-latest, platform: windows-x64, ext: ".exe" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compute version
+        shell: bash
+        run: echo "VERSION=$(cat VERSION).${{ github.run_number }}" >> "$GITHUB_ENV"
+
+      - name: Build magec + mage-lsp (Rust)
+        run: |
+          cargo build --release --manifest-path magec/Cargo.toml
+          cargo build --release --manifest-path mage-ls/Cargo.toml
+
+      - name: Build the mage package (mage + manifest-gen, via magec)
+        shell: bash
+        run: |
+          export PATH="$PWD/magec/target/release:$PWD/mage-ls/target/release:$PATH"
+          (cd mage && magec build)        # → mage/out/mage and mage/out/manifest-gen
+
+      - name: Assemble + zip bundle
+        shell: bash
+        run: |
+          B="mage-$VERSION-${{ matrix.platform }}"
+          mkdir -p "stage/$B/bin"
+          cp "magec/target/release/magec${{ matrix.ext }}"     "stage/$B/bin/"
+          cp "mage-ls/target/release/mage-lsp${{ matrix.ext }}" "stage/$B/bin/"
+          cp "mage/out/mage${{ matrix.ext }}"                  "stage/$B/bin/"
+          # cp -r mage-zed "stage/$B/ext/mage-zed"   # optional editor bundle
+          (cd "stage/$B" && zip -r "../$B.zip" .)
+          sha256sum "stage/$B.zip" | cut -d' ' -f1 > "stage/$B.zip.sha256"
+
+      # The publish job needs manifest-gen; upload it from the Linux runner once.
+      - name: Upload manifest-gen (linux only)
+        if: matrix.platform == 'linux-x64'
+        uses: actions/upload-artifact@v4
+        with: { name: tool-manifest-gen, path: mage/out/manifest-gen }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform }}
+          path: |
+            stage/*.zip
+            stage/*.zip.sha256
+
+  # ---- 2. Collect bundles, build manifest, publish to Pages -----------------
+  publish:
+    needs: bundle
+    runs-on: ubuntu-latest
+    environment: github-pages
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, pattern: bundle-*, merge-multiple: true }
+      - uses: actions/download-artifact@v4
+        with: { name: tool-manifest-gen, path: tool }
+
+      - name: Compute version + URL base
+        run: |
+          echo "VERSION=$(cat VERSION 2>/dev/null || echo 0.1).${{ github.run_number }}" >> "$GITHUB_ENV"
+          echo "BASE=https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/toolchain" >> "$GITHUB_ENV"
+
+      - name: Lay out the Pages site + generate latest.bin
+        run: |
+          chmod +x tool/manifest-gen
+          mkdir -p site/toolchain/$VERSION
+          cp artifacts/*.zip site/toolchain/$VERSION/
+          ARGS=()
+          for p in linux-x64 windows-x64; do
+            sha="$(cat artifacts/mage-$VERSION-$p.zip.sha256)"
+            ARGS+=("$p" "$BASE/$VERSION/mage-$VERSION-$p.zip" "$sha")
+          done
+          ./tool/manifest-gen site/toolchain/latest.bin "$VERSION" "${ARGS[@]}"
+
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: site }
+      - uses: actions/deploy-pages@v4
