@@ -1,30 +1,57 @@
 name: release-toolchain
+# This repo (mage-releases) only HOSTS the Pages site + Releases. The compiler
+# source lives in blessedbythestorm/mage, which we check out and build here.
 on:
-  push: { branches: [master] }      # or tags ['v*'], or workflow_dispatch
   workflow_dispatch:
+    inputs:
+      mage_ref:
+        description: "mage compiler git ref to build"
+        default: master
 
 permissions:
-  contents: read
-  pages: write
+  contents: write   # create GitHub Releases + upload bundle assets
+  pages: write      # deploy latest.bin to Pages
   id-token: write
 
 jobs:
-  # ---- 1. Build a bundle on each target OS ----------------------------------
+  # Single source of truth for the version, shared by every job.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: echo "version=0.1.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+  # Build a self-contained bundle per platform. Linux-only for now; Windows
+  # needs static LLVM 21 provisioning (see notes at bottom).
   bundle:
+    needs: version
     strategy:
       matrix:
         include:
-          - { os: ubuntu-latest,  platform: linux-x64,   ext: ""    }
-          - { os: windows-latest, platform: windows-x64, ext: ".exe" }
+          - { os: ubuntu-latest, platform: linux-x64, ext: "" }
     runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the mage compiler repo
+        uses: actions/checkout@v4
+        with:
+          repository: blessedbythestorm/mage
+          ref: ${{ github.event.inputs.mage_ref || 'master' }}
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "magec -> target\nmage-ls -> target" }
 
-      - name: Compute version
-        shell: bash
-        run: echo "VERSION=$(cat VERSION).${{ github.run_number }}" >> "$GITHUB_ENV"
+      - name: Install LLVM 21 (magec links inkwell/llvm21)
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y llvm-21-dev libllvm21
+          echo "LLVM_SYS_211_PREFIX_LINUX=$(llvm-config-21 --prefix)" >> "$GITHUB_ENV"
 
       - name: Build magec + mage-lsp (Rust)
         run: |
@@ -32,24 +59,20 @@ jobs:
           cargo build --release --manifest-path mage-ls/Cargo.toml
 
       - name: Build the mage package (mage + manifest-gen, via magec)
-        shell: bash
         run: |
           export PATH="$PWD/magec/target/release:$PWD/mage-ls/target/release:$PATH"
-          (cd mage && magec build)        # → mage/out/mage and mage/out/manifest-gen
+          (cd mage && magec build)
 
-      - name: Assemble + zip bundle
-        shell: bash
+      - name: Assemble + zip the bundle
         run: |
           B="mage-$VERSION-${{ matrix.platform }}"
           mkdir -p "stage/$B/bin"
-          cp "magec/target/release/magec${{ matrix.ext }}"     "stage/$B/bin/"
+          cp "magec/target/release/magec${{ matrix.ext }}"      "stage/$B/bin/"
           cp "mage-ls/target/release/mage-lsp${{ matrix.ext }}" "stage/$B/bin/"
-          cp "mage/out/mage${{ matrix.ext }}"                  "stage/$B/bin/"
-          # cp -r mage-zed "stage/$B/ext/mage-zed"   # optional editor bundle
+          cp "mage/out/mage${{ matrix.ext }}"                   "stage/$B/bin/"
           (cd "stage/$B" && zip -r "../$B.zip" .)
           sha256sum "stage/$B.zip" | cut -d' ' -f1 > "stage/$B.zip.sha256"
 
-      # The publish job needs manifest-gen; upload it from the Linux runner once.
       - name: Upload manifest-gen (linux only)
         if: matrix.platform == 'linux-x64'
         uses: actions/upload-artifact@v4
@@ -62,33 +85,38 @@ jobs:
             stage/*.zip
             stage/*.zip.sha256
 
-  # ---- 2. Collect bundles, build manifest, publish to Pages -----------------
+  # Publish: zips -> GitHub Release (binary storage), latest.bin -> Pages.
   publish:
-    needs: bundle
+    needs: [version, bundle]
     runs-on: ubuntu-latest
     environment: github-pages
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/download-artifact@v4
         with: { path: artifacts, pattern: bundle-*, merge-multiple: true }
       - uses: actions/download-artifact@v4
         with: { name: tool-manifest-gen, path: tool }
 
-      - name: Compute version + URL base
+      - name: Publish bundles as a GitHub Release
+        env: { GH_TOKEN: ${{ github.token }} }
         run: |
-          echo "VERSION=$(cat VERSION 2>/dev/null || echo 0.1).${{ github.run_number }}" >> "$GITHUB_ENV"
-          echo "BASE=https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/toolchain" >> "$GITHUB_ENV"
+          gh release create "v$VERSION" artifacts/*.zip \
+            --repo "${{ github.repository }}" \
+            --title "mage $VERSION" --notes "Automated toolchain build."
 
-      - name: Lay out the Pages site + generate latest.bin
+      - name: Generate latest.bin (bundle urls -> release assets)
         run: |
           chmod +x tool/manifest-gen
-          mkdir -p site/toolchain/$VERSION
-          cp artifacts/*.zip site/toolchain/$VERSION/
+          mkdir -p site
           ARGS=()
-          for p in linux-x64 windows-x64; do
+          for p in linux-x64; do
             sha="$(cat artifacts/mage-$VERSION-$p.zip.sha256)"
-            ARGS+=("$p" "$BASE/$VERSION/mage-$VERSION-$p.zip" "$sha")
+            url="https://github.com/${{ github.repository }}/releases/download/v$VERSION/mage-$VERSION-$p.zip"
+            ARGS+=("$p" "$url" "$sha")
           done
-          ./tool/manifest-gen site/toolchain/latest.bin "$VERSION" "${ARGS[@]}"
+          ./tool/manifest-gen site/latest.bin "$VERSION" "${ARGS[@]}"
+          printf '<!doctype html><h1>mage toolchain</h1><p>latest: %s</p><p><a href="latest.bin">latest.bin</a></p>\n' "$VERSION" > site/index.html
 
       - uses: actions/upload-pages-artifact@v3
         with: { path: site }
