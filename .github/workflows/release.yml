@@ -37,6 +37,11 @@ jobs:
         with:
           repository: blessedbythestorm/mage
           ref: ${{ github.event.inputs.mage_ref || 'master' }}
+          # `mage` is private, so the default GITHUB_TOKEN (scoped to this repo)
+          # can't read it. Add a fine-grained PAT with read access to `mage` as
+          # the MAGE_REPO_TOKEN secret. (Falls back to the default token, which
+          # works if you make `mage` public instead.)
+          token: ${{ secrets.MAGE_REPO_TOKEN || github.token }}
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
