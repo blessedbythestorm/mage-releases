@@ -78,7 +78,7 @@ jobs:
       - name: Assemble + zip the bundle
         run: |
           B="mage-$VERSION-${{ matrix.platform }}"
-          mkdir -p "stage/$B/bin" "stage/$B/ext"
+          mkdir -p "stage/$B/bin" "stage/$B/ext" "stage/$B/lib"
           cp "magec/target/release/magec${{ matrix.ext }}"      "stage/$B/bin/"
           cp "mage-ls/target/release/mage-lsp${{ matrix.ext }}" "stage/$B/bin/"
           cp "mage/out/mage${{ matrix.ext }}"                   "stage/$B/bin/"
@@ -116,6 +116,16 @@ jobs:
           # Bundle the Zed editor extension (source; Zed builds it on install).
           cp -r mage-zed "stage/$B/ext/mage-zed"
           rm -rf "stage/$B/ext/mage-zed/target" "stage/$B/ext/mage-zed/.git"
+          # Bundle the standard library (source) + its mandatory minicoro sibling.
+          # std is the implicit dependency of every project, so the installed
+          # toolchain must carry it to compile anything; magec discovers it at
+          # <toolchain>/lib/std relative to its own binary. std/build.m does
+          # b.depend("../minicoro"), so minicoro must sit beside std. Ship source
+          # only — strip per-package build artifacts.
+          for pkg in std minicoro; do
+            rsync -a --exclude out --exclude .mage-cache --exclude .global-cache \
+              "lib/$pkg/" "stage/$B/lib/$pkg/"
+          done
           (cd "stage/$B" && zip -r "../$B.zip" .)
           sha256sum "stage/$B.zip" | cut -d' ' -f1 > "stage/$B.zip.sha256"
 
