@@ -67,10 +67,13 @@ jobs:
       - name: Assemble + zip the bundle
         run: |
           B="mage-$VERSION-${{ matrix.platform }}"
-          mkdir -p "stage/$B/bin"
+          mkdir -p "stage/$B/bin" "stage/$B/ext"
           cp "magec/target/release/magec${{ matrix.ext }}"      "stage/$B/bin/"
           cp "mage-ls/target/release/mage-lsp${{ matrix.ext }}" "stage/$B/bin/"
           cp "mage/out/mage${{ matrix.ext }}"                   "stage/$B/bin/"
+          # Bundle the Zed editor extension (source; Zed builds it on install).
+          cp -r mage-zed "stage/$B/ext/mage-zed"
+          rm -rf "stage/$B/ext/mage-zed/target" "stage/$B/ext/mage-zed/.git"
           (cd "stage/$B" && zip -r "../$B.zip" .)
           sha256sum "stage/$B.zip" | cut -d' ' -f1 > "stage/$B.zip.sha256"
 
