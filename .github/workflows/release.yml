@@ -9,12 +9,11 @@ on:
         default: master
 
 permissions:
-  contents: write   # create GitHub Releases + upload bundle assets
-  pages: write      # deploy latest.bin to Pages
+  contents: write
+  pages: write
   id-token: write
 
 jobs:
-  # Single source of truth for the version, shared by every job.
   version:
     runs-on: ubuntu-latest
     outputs:
@@ -23,8 +22,6 @@ jobs:
       - id: v
         run: echo "version=0.1.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
-  # Build a self-contained bundle per platform. Linux-only for now; Windows
-  # needs static LLVM 21 provisioning (see notes at bottom).
   bundle:
     needs: version
     strategy:
@@ -43,7 +40,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with: { workspaces: "magec -> target\nmage-ls -> target" }
 
       - name: Install LLVM 21 (magec links inkwell/llvm21)
         run: |
@@ -76,7 +72,9 @@ jobs:
       - name: Upload manifest-gen (linux only)
         if: matrix.platform == 'linux-x64'
         uses: actions/upload-artifact@v4
-        with: { name: tool-manifest-gen, path: mage/out/manifest-gen }
+        with:
+          name: tool-manifest-gen
+          path: mage/out/manifest-gen
 
       - uses: actions/upload-artifact@v4
         with:
@@ -85,21 +83,25 @@ jobs:
             stage/*.zip
             stage/*.zip.sha256
 
-  # Publish: zips -> GitHub Release (binary storage), latest.bin -> Pages.
   publish:
     needs: [version, bundle]
     runs-on: ubuntu-latest
     environment: github-pages
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@v4
-        with: { path: artifacts, pattern: bundle-*, merge-multiple: true }
+        with:
+          path: artifacts
+          pattern: bundle-*
+          merge-multiple: true
       - uses: actions/download-artifact@v4
-        with: { name: tool-manifest-gen, path: tool }
+        with:
+          name: tool-manifest-gen
+          path: tool
 
       - name: Publish bundles as a GitHub Release
-        env: { GH_TOKEN: ${{ github.token }} }
         run: |
           gh release create "v$VERSION" artifacts/*.zip \
             --repo "${{ github.repository }}" \
@@ -119,5 +121,6 @@ jobs:
           printf '<!doctype html><h1>mage toolchain</h1><p>latest: %s</p><p><a href="latest.bin">latest.bin</a></p>\n' "$VERSION" > site/index.html
 
       - uses: actions/upload-pages-artifact@v3
-        with: { path: site }
+        with:
+          path: site
       - uses: actions/deploy-pages@v4
