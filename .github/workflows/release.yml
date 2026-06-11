@@ -46,31 +46,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install LLVM 21 + mold (magec links inkwell/llvm21; mold is the default Linux linker)
+      - name: Install LLVM 21 + mold + patchelf (magec links inkwell/llvm21; mold is the default Linux linker; patchelf stamps the bundle's rpaths)
         run: |
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 21
-          sudo apt-get install -y llvm-21-dev libllvm21 mold
+          sudo apt-get install -y llvm-21-dev libllvm21 mold patchelf
           echo "LLVM_SYS_211_PREFIX_LINUX=$(llvm-config-21 --prefix)" >> "$GITHUB_ENV"
 
       - name: Build magec + mage-lsp (Rust)
         # magec/mage-lsp dynamically link libLLVM.so (fast builds, no static LLVM).
         # We ship libLLVM.so AND its whole dependency closure next to the binaries
         # (see the bundle step), so bake a $ORIGIN rpath pointing the loader at the
-        # executable's own dir. Two flags matter:
-        #   -rpath,$ORIGIN        resolve libs from the binary's dir ($ORIGIN
-        #                         follows symlinks, so the ~/.mage/bin launcher
-        #                         links resolve to toolchains/<v>/bin).
-        #   --disable-new-dtags   emit DT_RPATH (transitive) not DT_RUNPATH
-        #                         (immediate-deps only). Transitive is required so
-        #                         libLLVM's OWN deps (libedit, libxml2, …) also
-        #                         resolve from $ORIGIN — otherwise libLLVM would
-        #                         look for them on the system and fail on a clean box.
-        # $ORIGIN must reach the linker literally — set via env (GitHub does not
-        # shell-expand it).
+        # executable's own dir ($ORIGIN follows symlinks, so the ~/.mage/bin launcher
+        # links resolve to toolchains/<v>/bin). This rpath finds libLLVM, magec's
+        # DIRECT dependency; libLLVM's OWN transitive deps (libedit, libxml2, …) are
+        # handled by patchelf-ing a $ORIGIN rpath onto every bundled lib in the
+        # bundle step (the executable's rpath is not consulted for them). $ORIGIN
+        # must reach the linker literally — set via env (GitHub does not shell-expand it).
         env:
-          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN -C link-arg=-Wl,--disable-new-dtags"
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN"
         run: |
           cargo build --release --manifest-path magec/Cargo.toml
           cargo build --release --manifest-path mage-ls/Cargo.toml
@@ -91,8 +86,8 @@ jobs:
           # the toolchain runs on a clean machine. ldd flattens the whole recursive
           # tree; copy every resolved lib EXCEPT glibc + the compiler runtime, which
           # are present everywhere and unsafe to bundle (must match the host's
-          # ld-linux). magec's transitive DT_RPATH=$ORIGIN (baked above) then
-          # resolves all of them — including libLLVM's own deps — from this dir.
+          # ld-linux). The per-object $ORIGIN rpath stamped just below then lets each
+          # bundled lib find its siblings here.
           if ldd "stage/$B/bin/magec" | grep -q 'not found'; then
             echo "::error::libLLVM deps unresolved on the runner; closure would be incomplete"
             ldd "stage/$B/bin/magec" | grep 'not found'
@@ -108,6 +103,15 @@ jobs:
           if ! ls "stage/$B/bin/"libLLVM.so* >/dev/null 2>&1; then
             echo "::error::libLLVM.so was not bundled"; exit 1
           fi
+          # Stamp $ORIGIN onto EVERY bundled ELF (libs + binaries). The loader does
+          # NOT consult the executable's rpath when resolving a shared lib's own
+          # transitive deps — so libLLVM must carry its own $ORIGIN to find libedit,
+          # libedit to find libtinfo, libxml2 to find libicu, and so on. With each
+          # object pointing at its siblings here, the toolchain runs with no
+          # LD_LIBRARY_PATH on a clean machine.
+          for f in "stage/$B/bin/"*.so* "stage/$B/bin/magec" "stage/$B/bin/mage-lsp" "stage/$B/bin/mage"; do
+            patchelf --set-rpath '$ORIGIN' "$f"
+          done
           echo "bundled shared libs:"; ls -lh "stage/$B/bin/"*.so* | awk '{print $5, $9}'
           # Bundle the Zed editor extension (source; Zed builds it on install).
           cp -r mage-zed "stage/$B/ext/mage-zed"
