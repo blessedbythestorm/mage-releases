@@ -56,13 +56,21 @@ jobs:
 
       - name: Build magec + mage-lsp (Rust)
         # magec/mage-lsp dynamically link libLLVM.so (fast builds, no static LLVM).
-        # We ship that .so next to the binaries in the bundle, so bake an $ORIGIN
-        # rpath: the loader then resolves libLLVM from the executable's own
-        # directory ($ORIGIN follows symlinks, so the ~/.mage/bin launcher links
-        # resolve to toolchains/<v>/bin where the .so lives). $ORIGIN must reach
-        # the linker literally — set via env (GitHub does not shell-expand it).
+        # We ship libLLVM.so AND its whole dependency closure next to the binaries
+        # (see the bundle step), so bake a $ORIGIN rpath pointing the loader at the
+        # executable's own dir. Two flags matter:
+        #   -rpath,$ORIGIN        resolve libs from the binary's dir ($ORIGIN
+        #                         follows symlinks, so the ~/.mage/bin launcher
+        #                         links resolve to toolchains/<v>/bin).
+        #   --disable-new-dtags   emit DT_RPATH (transitive) not DT_RUNPATH
+        #                         (immediate-deps only). Transitive is required so
+        #                         libLLVM's OWN deps (libedit, libxml2, …) also
+        #                         resolve from $ORIGIN — otherwise libLLVM would
+        #                         look for them on the system and fail on a clean box.
+        # $ORIGIN must reach the linker literally — set via env (GitHub does not
+        # shell-expand it).
         env:
-          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN"
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN -C link-arg=-Wl,--disable-new-dtags"
         run: |
           cargo build --release --manifest-path magec/Cargo.toml
           cargo build --release --manifest-path mage-ls/Cargo.toml
@@ -79,16 +87,28 @@ jobs:
           cp "magec/target/release/magec${{ matrix.ext }}"      "stage/$B/bin/"
           cp "mage-ls/target/release/mage-lsp${{ matrix.ext }}" "stage/$B/bin/"
           cp "mage/out/mage${{ matrix.ext }}"                   "stage/$B/bin/"
-          # magec/mage-lsp dynamically link libLLVM.so — ship it next to them so
-          # the bundle is self-contained (the $ORIGIN rpath baked in above makes
-          # the loader find it here). cp -L dereferences the SONAME symlink chain;
-          # the copied file keeps the SONAME the loader's DT_NEEDED asks for.
-          llvm_so="$(ldd "stage/$B/bin/magec${{ matrix.ext }}" | awk '/libLLVM/ {print $3}')"
-          if [ -z "$llvm_so" ]; then
-            echo "::error::could not locate libLLVM.so via ldd"; exit 1
+          # Ship libLLVM.so AND its full dependency closure next to the binaries so
+          # the toolchain runs on a clean machine. ldd flattens the whole recursive
+          # tree; copy every resolved lib EXCEPT glibc + the compiler runtime, which
+          # are present everywhere and unsafe to bundle (must match the host's
+          # ld-linux). magec's transitive DT_RPATH=$ORIGIN (baked above) then
+          # resolves all of them — including libLLVM's own deps — from this dir.
+          if ldd "stage/$B/bin/magec" | grep -q 'not found'; then
+            echo "::error::libLLVM deps unresolved on the runner; closure would be incomplete"
+            ldd "stage/$B/bin/magec" | grep 'not found'
+            exit 1
           fi
-          cp -L "$llvm_so" "stage/$B/bin/$(basename "$llvm_so")"
-          echo "bundled $(basename "$llvm_so") ($(du -h "$llvm_so" | cut -f1))"
+          deny='^(libc|libm|libdl|librt|libpthread|ld-linux.*|linux-vdso|libstdc\+\+|libgcc_s)\.so'
+          ldd "stage/$B/bin/magec" | awk '/=> \// {print $3}' | while read -r so; do
+            base="$(basename "$so")"
+            echo "$base" | grep -Eq "$deny" && continue
+            dest="stage/$B/bin/$base"
+            [ -e "$dest" ] || cp -L "$so" "$dest"
+          done
+          if ! ls "stage/$B/bin/"libLLVM.so* >/dev/null 2>&1; then
+            echo "::error::libLLVM.so was not bundled"; exit 1
+          fi
+          echo "bundled shared libs:"; ls -lh "stage/$B/bin/"*.so* | awk '{print $5, $9}'
           # Bundle the Zed editor extension (source; Zed builds it on install).
           cp -r mage-zed "stage/$B/ext/mage-zed"
           rm -rf "stage/$B/ext/mage-zed/target" "stage/$B/ext/mage-zed/.git"
