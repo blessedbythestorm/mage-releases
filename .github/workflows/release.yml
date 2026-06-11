@@ -55,6 +55,14 @@ jobs:
           echo "LLVM_SYS_211_PREFIX_LINUX=$(llvm-config-21 --prefix)" >> "$GITHUB_ENV"
 
       - name: Build magec + mage-lsp (Rust)
+        # magec/mage-lsp dynamically link libLLVM.so (fast builds, no static LLVM).
+        # We ship that .so next to the binaries in the bundle, so bake an $ORIGIN
+        # rpath: the loader then resolves libLLVM from the executable's own
+        # directory ($ORIGIN follows symlinks, so the ~/.mage/bin launcher links
+        # resolve to toolchains/<v>/bin where the .so lives). $ORIGIN must reach
+        # the linker literally — set via env (GitHub does not shell-expand it).
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN"
         run: |
           cargo build --release --manifest-path magec/Cargo.toml
           cargo build --release --manifest-path mage-ls/Cargo.toml
@@ -71,6 +79,16 @@ jobs:
           cp "magec/target/release/magec${{ matrix.ext }}"      "stage/$B/bin/"
           cp "mage-ls/target/release/mage-lsp${{ matrix.ext }}" "stage/$B/bin/"
           cp "mage/out/mage${{ matrix.ext }}"                   "stage/$B/bin/"
+          # magec/mage-lsp dynamically link libLLVM.so — ship it next to them so
+          # the bundle is self-contained (the $ORIGIN rpath baked in above makes
+          # the loader find it here). cp -L dereferences the SONAME symlink chain;
+          # the copied file keeps the SONAME the loader's DT_NEEDED asks for.
+          llvm_so="$(ldd "stage/$B/bin/magec${{ matrix.ext }}" | awk '/libLLVM/ {print $3}')"
+          if [ -z "$llvm_so" ]; then
+            echo "::error::could not locate libLLVM.so via ldd"; exit 1
+          fi
+          cp -L "$llvm_so" "stage/$B/bin/$(basename "$llvm_so")"
+          echo "bundled $(basename "$llvm_so") ($(du -h "$llvm_so" | cut -f1))"
           # Bundle the Zed editor extension (source; Zed builds it on install).
           cp -r mage-zed "stage/$B/ext/mage-zed"
           rm -rf "stage/$B/ext/mage-zed/target" "stage/$B/ext/mage-zed/.git"
