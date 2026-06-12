@@ -25,10 +25,16 @@ jobs:
   bundle:
     needs: version
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { os: ubuntu-latest, platform: linux-x64, ext: "" }
+          - { os: windows-latest, platform: windows-x64, ext: ".exe" }
     runs-on: ${{ matrix.os }}
+    # The Windows leg is still being brought up: let it fail without failing
+    # the workflow or blocking publish, so the proven Linux release keeps
+    # shipping. (fail-fast: false keeps Linux running if Windows errors.)
+    continue-on-error: ${{ matrix.platform == 'windows-x64' }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -46,7 +52,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install LLVM 21 + mold + patchelf (magec links inkwell/llvm21; mold is the default Linux linker; patchelf stamps the bundle's rpaths)
+      - name: Install LLVM 21 + mold + patchelf (Linux)
+        if: runner.os == 'Linux'
         run: |
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
@@ -54,7 +61,26 @@ jobs:
           sudo apt-get install -y llvm-21-dev libllvm21 mold patchelf
           echo "LLVM_SYS_211_PREFIX_LINUX=$(llvm-config-21 --prefix)" >> "$GITHUB_ENV"
 
-      - name: Build magec + mage-lsp (Rust)
+      - name: Install LLVM 21 (Windows, prebuilt)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # llvm-sys/inkwell need LLVM 21.1 with llvm-config + libs, which the
+          # official LLVM Windows installer doesn't ship. vovkos/llvm-package-
+          # windows publishes exactly that, built on GitHub Actions for this use
+          # case. Use the libcmt (static-CRT) variant: magec's build.rs assumes
+          # the prebuilt LLVM is static-CRT (it adds /NODEFAULTLIB:libcmt.lib).
+          url="https://github.com/vovkos/llvm-package-windows/releases/download/llvm-21.1.1/llvm-21.1.1-windows-amd64-msvc17-libcmt.7z"
+          curl -sSL -o llvm.7z "$url"
+          7z x -ollvm-dist llvm.7z >/dev/null
+          cfg="$(find "$PWD/llvm-dist" -name llvm-config.exe | head -1)"
+          if [ -z "$cfg" ]; then echo "::error::llvm-config.exe not found in package"; exit 1; fi
+          prefix="$(dirname "$(dirname "$cfg")")"
+          echo "resolved LLVM prefix (msys): $prefix"
+          echo "LLVM_SYS_211_PREFIX_WINDOWS=$(cygpath -w "$prefix")" >> "$GITHUB_ENV"
+
+      - name: Build magec + mage-lsp (Linux)
+        if: runner.os == 'Linux'
         # magec/mage-lsp dynamically link libLLVM.so (fast builds, no static LLVM).
         # We ship libLLVM.so AND its whole dependency closure next to the binaries
         # (see the bundle step), so bake a $ORIGIN rpath pointing the loader at the
@@ -70,12 +96,29 @@ jobs:
           cargo build --release --manifest-path magec/Cargo.toml
           cargo build --release --manifest-path mage-ls/Cargo.toml
 
-      - name: Build the mage package (mage + manifest-gen, via magec)
+      - name: Build magec + mage-lsp (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        # No rpath on Windows — the loader finds DLLs beside the .exe. LLVM is
+        # static-CRT prebuilt; prefer-dynamic falls back to static if there's no
+        # LLVM-C.dll, which is fine (self-contained magec.exe).
+        run: |
+          cargo build --release --manifest-path magec/Cargo.toml
+          cargo build --release --manifest-path mage-ls/Cargo.toml
+          echo "=== smoke: does magec.exe link + run? ==="
+          ./magec/target/release/magec.exe --version
+
+      - name: Build the mage package (mage + manifest-gen, via magec) [Linux]
+        # Skipped on Windows: the Mage stdlib OS layer (std.os/sync/task, lib/http)
+        # is still POSIX-only, so the mage package can't link on Windows yet. The
+        # Windows bundle ships magec.exe + mage-lsp.exe only, for now.
+        if: runner.os == 'Linux'
         run: |
           export PATH="$PWD/magec/target/release:$PWD/mage-ls/target/release:$PATH"
           (cd mage && magec build)
 
-      - name: Assemble + zip the bundle
+      - name: Assemble + zip the bundle (Linux)
+        if: runner.os == 'Linux'
         run: |
           B="mage-$VERSION-${{ matrix.platform }}"
           mkdir -p "stage/$B/bin" "stage/$B/ext" "stage/$B/lib"
@@ -127,6 +170,31 @@ jobs:
               "lib/$pkg/" "stage/$B/lib/$pkg/"
           done
           (cd "stage/$B" && zip -r "../$B.zip" .)
+          sha256sum "stage/$B.zip" | cut -d' ' -f1 > "stage/$B.zip.sha256"
+
+      - name: Assemble + zip the bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        # Minimal Windows bundle: the compiler + LSP (both Rust) plus the LLVM
+        # DLL if magec dynamically linked it, and lld-link/clang for the user's
+        # build step. No mage.exe / lib yet (stdlib OS layer not ported).
+        run: |
+          B="mage-$VERSION-windows-x64"
+          mkdir -p "stage/$B/bin"
+          cp magec/target/release/magec.exe       "stage/$B/bin/"
+          cp mage-ls/target/release/mage-lsp.exe   "stage/$B/bin/"
+          P="$LLVM_SYS_211_PREFIX_WINDOWS"
+          Pmsys="$(cygpath -u "$P")"
+          # If magec.exe imports LLVM-C.dll (prefer-dynamic found a shared lib),
+          # ship it beside the exe; if it static-linked, this just won't exist.
+          for dll in $(cd "$Pmsys/bin" && ls LLVM-C.dll 2>/dev/null); do
+            cp "$Pmsys/bin/$dll" "stage/$B/bin/"
+          done
+          # Bundle the linker + C compiler magec shells out to at build time.
+          cp "$Pmsys/bin/lld-link.exe" "stage/$B/bin/" 2>/dev/null || true
+          cp "$Pmsys/bin/clang.exe"    "stage/$B/bin/" 2>/dev/null || true
+          echo "=== windows bundle contents ==="; ls -l "stage/$B/bin"
+          ( cd "stage/$B" && 7z a -tzip "../$B.zip" . >/dev/null )
           sha256sum "stage/$B.zip" | cut -d' ' -f1 > "stage/$B.zip.sha256"
 
       - name: Upload manifest-gen (linux only)
