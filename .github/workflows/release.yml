@@ -68,9 +68,12 @@ jobs:
           # llvm-sys/inkwell need LLVM 21.1 with llvm-config + libs, which the
           # official LLVM Windows installer doesn't ship. vovkos/llvm-package-
           # windows publishes exactly that, built on GitHub Actions for this use
-          # case. Use the libcmt (static-CRT) variant: magec's build.rs assumes
-          # the prebuilt LLVM is static-CRT (it adds /NODEFAULTLIB:libcmt.lib).
-          url="https://github.com/vovkos/llvm-package-windows/releases/download/llvm-21.1.1/llvm-21.1.1-windows-amd64-msvc17-libcmt.7z"
+          # case. Use the **msvcrt** (dynamic-CRT) variant: llvm-sys links LLVM
+          # statically into magec.exe, which links the dynamic UCRT — a libcmt
+          # (static-CRT) LLVM would put LLVM's allocations on a second heap and
+          # crash on any LLVM-C `free`. magec/build.rs (no longer adds
+          # /NODEFAULTLIB:libcmt) and magec/.cargo/config.toml require msvcrt.
+          url="https://github.com/vovkos/llvm-package-windows/releases/download/llvm-21.1.1/llvm-21.1.1-windows-amd64-msvc17-msvcrt.7z"
           curl -sSL -o llvm.7z "$url"
           7z x -ollvm-dist llvm.7z >/dev/null
           cfg="$(find "$PWD/llvm-dist" -name llvm-config.exe | head -1)"
