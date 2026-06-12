@@ -126,6 +126,15 @@ jobs:
           export PATH="$PWD/magec/target/release:$PWD/mage-ls/target/release:$PATH"
           (cd mage && magec build)
 
+      - name: Probe mage package build (Windows, non-fatal — surfaces unported stdlib/net)
+        if: runner.os == 'Windows'
+        shell: bash
+        continue-on-error: true
+        run: |
+          export PATH="$PWD/magec/target/release:$PWD/mage-ls/target/release:$PATH"
+          echo "=== attempting Windows mage build to enumerate unported symbols ==="
+          (cd mage && magec.exe build) 2>&1 | tail -80 || true
+
       - name: Assemble + zip the bundle (Linux)
         if: runner.os == 'Linux'
         run: |
