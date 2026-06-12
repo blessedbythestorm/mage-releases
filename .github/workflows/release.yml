@@ -199,10 +199,23 @@ jobs:
           for dll in LLVM-C.dll LTO.dll Remarks.dll; do
             [ -f "$Pmsys/bin/$dll" ] && cp "$Pmsys/bin/$dll" "stage/$B/bin/"
           done
-          # Bundle the linker + C compiler magec shells out to at build time.
+          # Bundle the linker + C compiler magec shells out to at build time
+          # (lld-link ships with the LLVM package; clang is in vovkos's separate
+          # clang package, so it may be absent here — tolerated for now).
           cp "$Pmsys/bin/lld-link.exe" "stage/$B/bin/" 2>/dev/null || true
           cp "$Pmsys/bin/clang.exe"    "stage/$B/bin/" 2>/dev/null || true
-          echo "=== windows bundle contents ==="; ls -l "stage/$B/bin"
+          # Ship the stdlib source + its minicoro sibling + the Zed extension, so
+          # the Windows bundle matches Linux (magec finds lib/std relative to its
+          # own exe). std can't fully *compile* on Windows until its OS layer is
+          # ported, but shipping the source keeps the bundle structurally complete.
+          mkdir -p "stage/$B/lib" "stage/$B/ext"
+          for pkg in std minicoro; do
+            cp -r "lib/$pkg" "stage/$B/lib/$pkg"
+            rm -rf "stage/$B/lib/$pkg/out" "stage/$B/lib/$pkg/.mage-cache" "stage/$B/lib/$pkg/.global-cache"
+          done
+          cp -r mage-zed "stage/$B/ext/mage-zed"
+          rm -rf "stage/$B/ext/mage-zed/target" "stage/$B/ext/mage-zed/.git"
+          echo "=== windows bundle contents ==="; ls -R "stage/$B" | head -40
           ( cd "stage/$B" && 7z a -tzip "../$B.zip" . >/dev/null )
           sha256sum "stage/$B.zip" | cut -d' ' -f1 > "stage/$B.zip.sha256"
 
@@ -212,6 +225,17 @@ jobs:
         with:
           name: tool-manifest-gen
           path: mage/out/manifest-gen
+
+      # The mage CLI is the standalone bootstrap: a user downloads it first,
+      # then `mage update` pulls the toolchain. It links no LLVM, so it ships
+      # as a separate bare binary. Linux only for now — a Windows mage.exe
+      # needs the stdlib OS/download layer ported (tracked separately).
+      - name: Upload mage CLI bootstrap (linux only)
+        if: matrix.platform == 'linux-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mage-cli-linux-x64
+          path: mage/out/mage
 
       - uses: actions/upload-artifact@v4
         with:
@@ -237,10 +261,17 @@ jobs:
         with:
           name: tool-manifest-gen
           path: tool
+      - uses: actions/download-artifact@v4
+        with:
+          name: mage-cli-linux-x64
+          path: magecli
 
       - name: Publish bundles as a GitHub Release
         run: |
-          gh release create "v$VERSION" artifacts/*.zip \
+          # Stable, versionless bootstrap names so /releases/latest/download/
+          # always points at the newest CLI.
+          cp magecli/mage mage-linux-x64
+          gh release create "v$VERSION" artifacts/*.zip mage-linux-x64 \
             --repo "${{ github.repository }}" \
             --title "mage $VERSION" --notes "Automated toolchain build."
 
