@@ -117,6 +117,20 @@ jobs:
           echo "=== smoke: does magec.exe link + run? ==="
           ./magec/target/release/magec.exe --version
 
+      - name: Set up MSVC dev environment (Windows)
+        if: runner.os == 'Windows'
+        # magec links Mage programs with `lld-link`, a bare COFF linker with no
+        # toolchain auto-detection: it finds import libs (ws2_32.lib, msvcrt.lib,
+        # kernel32.lib …) only via the `LIB` env var, which is set inside a VS
+        # Developer environment. clang already auto-detects the MSVC headers for
+        # the C compiles, but lld-link needs LIB exported explicitly. This action
+        # writes LIB/INCLUDE/PATH to GITHUB_ENV so the mage-package build below
+        # (and the Windows assemble step) inherit them. Placed after the magec.exe
+        # cargo build so that proven step's environment is untouched.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Build the mage package (mage + manifest-gen, via magec) [Linux]
         # Skipped on Windows: the Mage stdlib OS layer (std.os/sync/task, lib/http)
         # is still POSIX-only, so the mage package can't link on Windows yet. The
