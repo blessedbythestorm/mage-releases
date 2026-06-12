@@ -76,8 +76,17 @@ jobs:
           cfg="$(find "$PWD/llvm-dist" -name llvm-config.exe | head -1)"
           if [ -z "$cfg" ]; then echo "::error::llvm-config.exe not found in package"; exit 1; fi
           prefix="$(dirname "$(dirname "$cfg")")"
-          echo "resolved LLVM prefix (msys): $prefix"
-          echo "LLVM_SYS_211_PREFIX_WINDOWS=$(cygpath -w "$prefix")" >> "$GITHUB_ENV"
+          prefix_win="$(cygpath -w "$prefix")"
+          echo "resolved LLVM prefix: $prefix_win"
+          ls "$prefix/bin/LLVM-C.dll" >/dev/null 2>&1 && echo "LLVM-C.dll present -> dynamic link" || echo "::warning::no LLVM-C.dll -> static fallback"
+          # build.rs reads the _WINDOWS suffix for its cc include path; the
+          # llvm-sys crate reads the UNSUFFIXED var (or finds llvm-config on
+          # PATH). Set both, and put LLVM bin on PATH so (a) llvm-sys resolves
+          # llvm-config system-wide and (b) the magec.exe smoke test + runtime
+          # find LLVM-C.dll (it links dynamically against it).
+          echo "LLVM_SYS_211_PREFIX_WINDOWS=$prefix_win" >> "$GITHUB_ENV"
+          echo "LLVM_SYS_211_PREFIX=$prefix_win" >> "$GITHUB_ENV"
+          cygpath -w "$prefix/bin" >> "$GITHUB_PATH"
 
       - name: Build magec + mage-lsp (Linux)
         if: runner.os == 'Linux'
@@ -185,10 +194,10 @@ jobs:
           cp mage-ls/target/release/mage-lsp.exe   "stage/$B/bin/"
           P="$LLVM_SYS_211_PREFIX_WINDOWS"
           Pmsys="$(cygpath -u "$P")"
-          # If magec.exe imports LLVM-C.dll (prefer-dynamic found a shared lib),
-          # ship it beside the exe; if it static-linked, this just won't exist.
-          for dll in $(cd "$Pmsys/bin" && ls LLVM-C.dll 2>/dev/null); do
-            cp "$Pmsys/bin/$dll" "stage/$B/bin/"
+          # magec.exe links dynamically against LLVM-C.dll — ship it (and the LLVM
+          # DLLs it may pull in) beside the exe so the loader finds them.
+          for dll in LLVM-C.dll LTO.dll Remarks.dll; do
+            [ -f "$Pmsys/bin/$dll" ] && cp "$Pmsys/bin/$dll" "stage/$B/bin/"
           done
           # Bundle the linker + C compiler magec shells out to at build time.
           cp "$Pmsys/bin/lld-link.exe" "stage/$B/bin/" 2>/dev/null || true
