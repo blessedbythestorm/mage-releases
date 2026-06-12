@@ -140,14 +140,12 @@ jobs:
           export PATH="$PWD/magec/target/release:$PWD/mage-ls/target/release:$PATH"
           (cd mage && magec build)
 
-      - name: Probe mage package build (Windows, non-fatal — surfaces unported stdlib/net)
+      - name: Build the mage package (mage + manifest-gen, via magec) [Windows]
         if: runner.os == 'Windows'
         shell: bash
-        continue-on-error: true
         run: |
           export PATH="$PWD/magec/target/release:$PWD/mage-ls/target/release:$PATH"
-          echo "=== attempting Windows mage build to enumerate unported symbols ==="
-          (cd mage && magec.exe build) 2>&1 | tail -80 || true
+          (cd mage && magec.exe build)
 
       - name: Assemble + zip the bundle (Linux)
         if: runner.os == 'Linux'
@@ -207,14 +205,20 @@ jobs:
       - name: Assemble + zip the bundle (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        # Minimal Windows bundle: the compiler + LSP (both Rust) plus the LLVM
-        # DLL if magec dynamically linked it, and lld-link/clang for the user's
-        # build step. No mage.exe / lib yet (stdlib OS layer not ported).
+        # Full Windows bundle: the compiler + LSP (both Rust), the mage CLI +
+        # manifest-gen (built by magec from the now-ported stdlib), the LLVM
+        # DLL magec dynamically links, and lld-link/clang for the user's build
+        # step.
         run: |
           B="mage-$VERSION-windows-x64"
           mkdir -p "stage/$B/bin"
           cp magec/target/release/magec.exe       "stage/$B/bin/"
           cp mage-ls/target/release/mage-lsp.exe   "stage/$B/bin/"
+          # The mage CLI + manifest-gen are Mage programs magec just compiled;
+          # statically linked (CRT + ws2_32 + bcrypt are system DLLs), so they
+          # need no extra files beside them.
+          cp mage/out/mage.exe          "stage/$B/bin/"
+          cp mage/out/manifest-gen.exe  "stage/$B/bin/"
           P="$LLVM_SYS_211_PREFIX_WINDOWS"
           Pmsys="$(cygpath -u "$P")"
           # magec.exe links dynamically against LLVM-C.dll — ship it (and the LLVM
@@ -251,14 +255,20 @@ jobs:
 
       # The mage CLI is the standalone bootstrap: a user downloads it first,
       # then `mage update` pulls the toolchain. It links no LLVM, so it ships
-      # as a separate bare binary. Linux only for now — a Windows mage.exe
-      # needs the stdlib OS/download layer ported (tracked separately).
+      # as a separate bare binary per platform.
       - name: Upload mage CLI bootstrap (linux only)
         if: matrix.platform == 'linux-x64'
         uses: actions/upload-artifact@v4
         with:
           name: mage-cli-linux-x64
           path: mage/out/mage
+
+      - name: Upload mage CLI bootstrap (windows only)
+        if: matrix.platform == 'windows-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mage-cli-windows-x64
+          path: mage/out/mage.exe
 
       - uses: actions/upload-artifact@v4
         with:
@@ -288,13 +298,25 @@ jobs:
         with:
           name: mage-cli-linux-x64
           path: magecli
+      # Tolerate a missing Windows leg (its bundle job is continue-on-error):
+      # publish degrades to Linux-only rather than failing the whole release.
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: mage-cli-windows-x64
+          path: magecli-win
 
       - name: Publish bundles as a GitHub Release
         run: |
           # Stable, versionless bootstrap names so /releases/latest/download/
           # always points at the newest CLI.
           cp magecli/mage mage-linux-x64
-          gh release create "v$VERSION" artifacts/*.zip mage-linux-x64 \
+          ASSETS=(artifacts/*.zip mage-linux-x64)
+          if [ -f magecli-win/mage.exe ]; then
+            cp magecli-win/mage.exe mage-windows-x64.exe
+            ASSETS+=(mage-windows-x64.exe)
+          fi
+          gh release create "v$VERSION" "${ASSETS[@]}" \
             --repo "${{ github.repository }}" \
             --title "mage $VERSION" --notes "Automated toolchain build."
 
@@ -302,8 +324,11 @@ jobs:
         run: |
           chmod +x tool/manifest-gen
           mkdir -p site
+          # Only advertise platforms whose bundle zip actually shipped.
+          PLATFORMS=(linux-x64)
+          [ -f "artifacts/mage-$VERSION-windows-x64.zip.sha256" ] && PLATFORMS+=(windows-x64)
           ARGS=()
-          for p in linux-x64; do
+          for p in "${PLATFORMS[@]}"; do
             sha="$(cat artifacts/mage-$VERSION-$p.zip.sha256)"
             url="https://github.com/${{ github.repository }}/releases/download/v$VERSION/mage-$VERSION-$p.zip"
             ARGS+=("$p" "$url" "$sha")
